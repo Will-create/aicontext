@@ -8,7 +8,12 @@
 POST https://totaljsbackend.com/api/
 ```
 
-Always `POST`. Always the same path. This never changes.
+Always use one API endpoint. The path is project-specific:
+
+- Generic examples often use `POST /api/`
+- Projects with `ROUTE('API / ...')` use `POST /`
+
+Keep the path configurable, for example with `EXPO_PUBLIC_API_PATH`.
 
 ### Headers
 
@@ -16,6 +21,10 @@ Always `POST`. Always the same path. This never changes.
 |--------|----------|-------|
 | `Content-Type` | Always | `application/json` |
 | `x-token` | For protected schemas | Session token obtained at login |
+
+`x-token` is the portable baseline. Some projects also accept `token: <session_token>` and `Authorization: Bearer <session_token>` for compatibility with middleware or file services. It is safe for a mobile client to send all three headers for protected schemas when the backend supports them.
+
+Do not attach tokens to known public schemas if the app can avoid it. Keep a client-side anonymous allowlist based on the backend team's public schema contract and verified route behavior.
 
 ### Body envelope
 
@@ -81,6 +90,14 @@ Always `POST`. Always the same path. This never changes.
 }
 ```
 
+### Optional GET helper
+
+Some Total.js projects support `GET /?schema=<schema_string>` for read-only helper calls. Treat this as project-specific convenience. The durable contract remains the JSON envelope:
+
+```text
+GET /?schema=products_smart_list%3Flimit%3D20
+```
+
 ---
 
 ## Response
@@ -125,6 +142,14 @@ Some schemas (particularly login) return an array:
 ```typescript
 const item = Array.isArray(response) ? response[0] : response;
 ```
+
+Production clients should centralize this normalization:
+
+- Collapse one-item transport arrays.
+- Throw when `success === false` or `error` exists.
+- Return `value` when present.
+- Preserve a root `token` from login responses.
+- Accept raw arrays and `{ items: [] }` for list helpers.
 
 ### `value` by operation type
 
@@ -243,6 +268,16 @@ Step 2 — Register in the app:
 ```
 
 The upload service token is separate from the session token — it is a static credential provided by the backend team, scoped to the upload service only.
+
+React Native upload clients should support these project variants:
+
+- Upload URL contains `{id}` or `{0}` placeholder: replace it with active business id, user id, or `anonymous`.
+- Upload URL has no placeholder: append the bucket id as the final path segment.
+- Upload token with no configured header: add `?token=<upload_token>` unless already present.
+- Upload token with configured header: send it in that header, using `Bearer <token>` when the header is `Authorization`.
+- No upload token: send the user session token as `token`, `x-token`, and `Authorization`.
+
+Normalize relative upload response URLs into absolute URLs using the file service origin.
 
 ---
 

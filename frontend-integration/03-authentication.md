@@ -11,7 +11,7 @@ There are no cookies, no JWTs with decodable claims, no refresh tokens in the st
 ## Token lifecycle
 
 ```
-1.  POST /api/ { schema: "account_login", data: { email, password } }
+1.  POST /api/ or / { schema: "account_login", data: { email, password } }
            ↓
 2.  Server returns session token
            ↓
@@ -23,10 +23,12 @@ There are no cookies, no JWTs with decodable claims, no refresh tokens in the st
            ↓
 6.  On 401 → clear stored token → redirect to login screen
            ↓
-7.  On logout: POST /api/ { schema: "account_logout" } → clear stored token
+7.  On logout: POST /api/ or / { schema: "account_logout" } → clear stored token
 ```
 
 The 401 handler lives in the HTTP client interceptor, runs globally, and requires no per-call handling.
+
+On React Native, keep the token in `expo-secure-store`. Persisted Zustand/MMKV state can keep a user snapshot and preferences, but the session token should be restored from secure storage during app bootstrap.
 
 ---
 
@@ -65,6 +67,26 @@ Login may return an **array** with one object. Always handle both array and plai
 ```
 
 Store `token` (or `response[0].token`) as the session token. The user object is in `value`.
+
+Mobile projects can expose a dedicated mobile login schema:
+
+```json
+POST /api/
+{
+  "schema": "account_login_mobile",
+  "data": {
+    "phone": "+22600000000",
+    "country": "BF",
+    "password": "hunter2"
+  }
+}
+```
+
+Normalize both `{ "token": "...", "user": { ... } }` and a plain token string into one client shape:
+
+```typescript
+type LoginResult = { token: string; user?: User };
+```
 
 ### Failure response
 
@@ -109,6 +131,8 @@ POST /api/
 ```
 
 `value` is the session token string directly. Store it and consider the user authenticated. Then call `account` to hydrate the user object.
+
+Mobile registration may use `account_create_mobile` and include fields such as `phone`, `country`, `language`, `terms`, `type`, `firstname`, or `lastname`.
 
 ---
 
@@ -162,16 +186,22 @@ This is the correct pattern on every platform:
 ```
 App starts
   ↓
-Read token from storage
-  ├── No token → show login screen, done
-  └── Token present → POST /api/ { schema: "account" }
+Wait for persisted app state hydration
+  ↓
+Restore non-sensitive preferences (language, country, city)
+  ↓
+Read token from secure storage
+  ├── No token → show public/guest shell, done
+  └── Token present → POST /api/ or / { schema: "account" }
                             ↓
                        success?
-                         ├── Yes → set user in state, show app
-                         └── No (401 or error) → clear token, show login screen
+                         ├── Yes → set user in state, hydrate memberships, show app
+                         └── No (401 or error) → clear token, show public/guest shell
 ```
 
 The loading/splash state during this check prevents a flash of the unauthenticated UI.
+
+Buyer/marketplace apps can be guest-first: public screens are available without auth, auth opens as a modal, and seller-only routes mount only when authenticated.
 
 ---
 
@@ -203,6 +233,20 @@ POST /api/
 ```
 
 The server emails a reset link with a time-limited token.
+
+Some projects use `account_password` for the reset request and reserve `account_password_reset` for submitting the new password:
+
+```json
+POST /api/
+{
+  "schema": "account_password_reset",
+  "data": {
+    "token": "<reset_token>",
+    "password": "new-password",
+    "confirm": "new-password"
+  }
+}
+```
 
 ### Verify email address
 
@@ -255,6 +299,30 @@ POST /api/
 ```
 
 Response format mirrors standard login — store the returned token.
+
+SahelBusiness-style mobile integrations also use:
+
+| Schema | Purpose |
+|--------|---------|
+| `account_login_facebook` | Exchange Facebook mobile token for backend session. |
+| `account_oauth_mobile` | Exchange a mobile OAuth session id for backend session. |
+| `account_google` / `account_facebook` | Start provider flow and return redirect/session metadata. |
+
+---
+
+## OTP / phone verification
+
+OTP flows are usually public until a code is exchanged for an authenticated action.
+
+| Schema | Auth | Purpose |
+|--------|------|---------|
+| `otp_sms` | Public | Send an SMS code. |
+| `otp_sms_verify` | Public | Verify an SMS code. |
+| `otp_sms_verify_mobile` | Public | Verify SMS code for a mobile auth flow. |
+| `otp_email` | Public | Send an email code. |
+| `otp_email_verify` | Public | Verify an email code. |
+
+Keep these schemas in the anonymous allowlist so a stale local token does not change their behavior.
 
 ---
 

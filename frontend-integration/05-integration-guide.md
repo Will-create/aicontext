@@ -22,9 +22,9 @@ Every service in your app calls this one function. You configure auth once. You 
 ┌─────────────────────────────────────────┐
 │         UI / Screens / Components        │  render, user input, call hooks
 ├─────────────────────────────────────────┤
-│              Custom Hooks                │  state, side effects, actions
+│       Custom Hooks / Navigation          │  state, side effects, auth gates
 ├─────────────────────────────────────────┤
-│             Service Layer                │  schema strings, typed signatures
+│       Domain API / Service Layer         │  schema strings, typed signatures
 ├─────────────────────────────────────────┤
 │              API Client                  │  one function, interceptors, errors
 └─────────────────────────────────────────┘
@@ -40,9 +40,10 @@ Each layer has one job. Nothing leaks across layer boundaries.
 
 Responsibilities:
 - Configure base URL
-- Attach `x-token` to every request via an interceptor
-- Handle HTTP `401` globally — clear token, redirect to login
-- Normalize the response (return `response.data`)
+- Attach token headers to protected requests via an interceptor
+- Avoid attaching stale tokens to anonymous schemas
+- Handle HTTP `401` globally for protected schemas
+- Normalize response envelopes, one-item arrays, root tokens, and errors
 - Wrap errors into a consistent thrown shape
 
 ```typescript
@@ -83,6 +84,8 @@ export async function apiRequest(schema: string, data?: unknown): Promise<any> {
 ```
 
 `getStoredToken`, `clearStoredToken`, and `redirectToLogin` are the only platform-specific parts of this layer.
+
+Production mobile clients should make the endpoint path configurable. Generic examples often use `/api/`; Total.js projects that declare `ROUTE('API / ...')` use `/`.
 
 ---
 
@@ -254,6 +257,20 @@ The global auth object exposes:
 
 The `isLoading` state is critical — it prevents the login screen from flashing before the token check completes.
 
+For marketplace apps, prefer a guest-first shell when the product allows public browsing:
+
+```text
+AppRoot
+  -> wait for persisted state hydration
+  -> restore language/location preferences
+  -> load secure token
+  -> no token: show public buyer shell
+  -> token: hydrate account + memberships
+  -> seller mode only mounts when authenticated
+```
+
+Keep the session token in secure storage. Persist only non-secret state such as user snapshot, active business id, app mode, language, country/city, cart count, and notification count.
+
 ---
 
 ## Handling the array response format
@@ -268,13 +285,15 @@ if (!item.success) throw new Error(item.error || 'Login failed');
 // item.token is the session token
 ```
 
+Better: normalize all transport formats inside the API client. Screens and hooks should receive domain values, not `{ success, value }` wrappers.
+
 ---
 
 ## Error handling strategy
 
 | Layer | Responsibility |
 |-------|---------------|
-| API Client interceptor | HTTP `401` → clear token + redirect (silent) |
+| API Client interceptor | Protected HTTP `401` → clear token + redirect or show guest shell |
 | Service layer | Re-throw without catching (do not swallow errors) |
 | Hook `catch` block | Call `extractErrorMessage`, set `error` state |
 | UI component | Read `error` from hook, display a user-facing message |
@@ -311,6 +330,8 @@ const schema = buildSchema('posts_list', { page: 2, limit: 20, status: 'publishe
 | React Native | `expo-secure-store` | Keychain (iOS) / Keystore (Android). Never use plain `AsyncStorage` for tokens. |
 | Flutter | `flutter_secure_storage` | Keychain (iOS) / Keystore (Android). |
 
+React Native apps can use MMKV/Zustand persist for app state, but not as the source of truth for the session token.
+
 ---
 
 ## File upload — two-step pattern
@@ -325,6 +346,24 @@ const schema = buildSchema('posts_list', { page: 2, limit: 20, status: 'publishe
 
 Step 1 uses the upload service token (static, from your env config).  
 Step 2 uses the session token (from the logged-in user).
+
+Mobile upload helpers should support `{id}` or `{0}` placeholders in the upload URL, append the bucket id when no placeholder is present, and normalize relative returned URLs against the upload service origin.
+
+---
+
+## React Native production checklist
+
+- `apiRequest()` is the only low-level API entrypoint.
+- API host, API path, upload URL, upload token, and upload auth header come from Expo env variables.
+- Native `localhost` URLs are rejected or replaced unless explicitly allowed.
+- Token is stored in `expo-secure-store`.
+- Zustand/MMKV persists only non-secret app state.
+- Anonymous schemas are allowlisted from the backend public schema contract and verified route behavior.
+- The client does not attach stale tokens to login/register/public discovery/OTP calls.
+- Protected `401` clears auth state; public `401` does not.
+- Response normalization handles `{ success, value }`, array envelopes, raw arrays, root `token`, and `{ items: [] }`.
+- Dev network logs mask fields matching token/password/secret/authorization/cookie.
+- Seller navigation is gated by auth and business memberships.
 
 ---
 

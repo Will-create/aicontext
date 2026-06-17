@@ -56,6 +56,15 @@ x-token: <session_token>           ← omitted for public schemas
 
 This is the only URL your client ever calls. There are no other routes to discover.
 
+The path is project-defined. Many examples use `/api/`, while SahelBusiness-style projects register API routing on the root path:
+
+```javascript
+ROUTE('API / +account_login --> Customers/Login/exec');
+ROUTE('+API / -account_logout --> Customers/logout');
+```
+
+For those projects the client calls `POST https://api.example.com/` with the same `{ schema, data }` envelope. Make the API path configurable instead of hard-coding `/api/`.
+
 ---
 
 ## The schema string
@@ -156,6 +165,10 @@ x-token: <session_token>
 - All protected schemas require it.
 - A missing or invalid token results in HTTP `401`.
 - The token is an opaque string — do not attempt to decode it client-side.
+
+Do not infer frontend authorization from the `+` or `-` prefix inside a Total.js API route string. Those prefixes are Total.js routing/action metadata and are not a portable public/protected contract.
+
+Frontend auth behavior should be documented separately by the backend team or verified from route middleware and actual responses. Mirror known public schemas in the frontend with an anonymous allowlist so login, registration, discovery, and OTP flows are not affected by old local sessions.
 
 ---
 

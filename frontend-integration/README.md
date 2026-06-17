@@ -16,7 +16,7 @@ This guide stack is designed to be reused across projects. Replace `totaljsbacke
 | [04-api-reference.md](./04-api-reference.md) | Schema naming conventions, standard CRUD patterns, and a full annotated example domain |
 | [05-integration-guide.md](./05-integration-guide.md) | Client architecture — the four-layer pattern, error strategy, token storage |
 | [06-react-integration.md](./06-react-integration.md) | React (Vite + TypeScript) — complete, copy-pasteable implementation |
-| [07-react-native-integration.md](./07-react-native-integration.md) | React Native (Expo) — complete implementation with mobile-specific concerns |
+| [07-react-native-integration.md](./07-react-native-integration.md) | React Native (Expo) — environment-aware mobile implementation, auth hydration, uploads, guest/seller flows |
 | [08-flutter-integration.md](./08-flutter-integration.md) | Flutter (Dart) — complete implementation |
 
 ---
@@ -24,7 +24,7 @@ This guide stack is designed to be reused across projects. Replace `totaljsbacke
 ## The three facts you need to know first
 
 ```
-1. Every API call is:   POST https://totaljsbackend.com/api/
+1. Every API call is:   POST https://totaljsbackend.com/api/  (or / when the backend uses ROUTE('API / ...'))
 2. Every request body:  { "schema": "resource_action[/id][?params]", "data": { ... } }
 3. Every auth:          x-token: <session_token>  (header, injected globally)
 ```
@@ -39,5 +39,6 @@ That is the entire surface area of a Total.js API Routing backend from the clien
 2. **02** — internalize the exact wire format
 3. **03** — implement auth before anything else
 4. **05** — understand the recommended client architecture
-5. **Your platform guide** (06, 07, or 08) — copy the boilerplate, adapt to your domain
-6. **04** — reference when you need to know how a schema should be named or structured
+5. **07** for React Native — implement environment config, auth hydration, anonymous schemas, uploads
+6. **Your platform guide** (06, 07, or 08) — copy the boilerplate, adapt to your domain
+7. **04** — reference when you need to know how a schema should be named or structured

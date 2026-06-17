@@ -1,9 +1,10 @@
 # React Native Integration Guide
 
-Complete implementation for a React Native app (Expo) connecting to a Total.js API Routing backend.
-Stack: **Expo + TypeScript + axios + expo-secure-store + Zustand**.
+Complete implementation notes for an Expo React Native app connected to a Total.js API Routing backend.
 
-Adapt `totaljsbackend.com` and the example resource `posts` to your project.
+Reference stack: **Expo + TypeScript + axios + expo-secure-store + Zustand persist + MMKV fallback**.
+
+This guide captures the patterns used by the SahelBusiness mobile app. Replace the schema names and hostnames with the ones from your project, but keep the same client architecture.
 
 ---
 
@@ -13,554 +14,355 @@ Adapt `totaljsbackend.com` and the example resource `posts` to your project.
 npx create-expo-app my-app --template expo-template-blank-typescript
 cd my-app
 npx expo install expo-secure-store
-npm install axios zustand
+npm install axios zustand react-native-mmkv
 ```
 
----
+Recommended structure:
 
-## Project structure
-
-```
+```text
 src/
   api/
-    client.ts          ← axios instance + interceptors + apiRequest()
-    tokenStorage.ts    ← SecureStore wrapper
-    authEvents.ts      ← event bus for 401 redirect
-  services/
-    authService.ts
-    postsService.ts
+    client.ts          # axios instance, apiRequest(), response/error normalization
+    auth.ts            # auth schemas
+    session.ts         # token save + startup hydration
+    upload.ts          # multipart upload helper
+    index.ts           # domain APIs
   store/
-    authStore.ts       ← Zustand auth state
+    useAppStore.ts     # auth, mode, active business, persisted preferences
   hooks/
-    usePosts.ts
-    useBackendSocket.ts
-  utils/
-    errorHandler.ts
-  screens/
-    LoginScreen.tsx
-    RegisterScreen.tsx
-    PostsScreen.tsx
+    useAuthGate.ts     # queue protected actions behind login
   navigation/
-    AppNavigator.tsx
+    RootNavigator.tsx  # bootstrap + buyer/seller/auth shells
 ```
 
 ---
 
-## Token storage — `src/api/tokenStorage.ts`
+## Environment Config
+
+Expo exposes public client variables with the `EXPO_PUBLIC_` prefix. Keep secrets out of the app bundle; upload tokens are only acceptable when they are intentionally scoped to the file service.
+
+| Variable | Purpose |
+|----------|---------|
+| `EXPO_PUBLIC_APP_ENV` | `dev` or `production`; selects suffixed values. |
+| `EXPO_PUBLIC_API_BASE_URL` | Default API host. |
+| `EXPO_PUBLIC_API_BASE_URL_DEV` | Dev API host override. |
+| `EXPO_PUBLIC_API_BASE_URL_PRODUCTION` | Production API host override. |
+| `EXPO_PUBLIC_API_PATH` | API path, usually `/` for `ROUTE('API / ...')` projects or `/api/` for conventional deployments. |
+| `EXPO_PUBLIC_UPLOAD_URL` | File service upload base URL. |
+| `EXPO_PUBLIC_UPLOAD_TOKEN` | Optional file service token. |
+| `EXPO_PUBLIC_UPLOAD_AUTH_HEADER` | Optional header name for the upload token, for example `Authorization`. |
+| `EXPO_PUBLIC_ALLOW_LOCALHOST_NATIVE` | Set to `true` only when a native runtime can really reach `localhost`. |
+
+Native iOS/Android runtimes usually cannot reach the host machine through `localhost` or `127.0.0.1`. Detect loopback hosts and replace them with a reachable default or LAN/proxy URL unless `EXPO_PUBLIC_ALLOW_LOCALHOST_NATIVE=true`.
 
 ```typescript
-import * as SecureStore from 'expo-secure-store';
+function hasLoopbackHost(url: string): boolean {
+  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(url.trim());
+}
 
-const KEY = 'totaljs_session_token';
-
-export const tokenStorage = {
-  get: (): Promise<string | null> => SecureStore.getItemAsync(KEY),
-  set: (token: string): Promise<void> => SecureStore.setItemAsync(KEY, token),
-  clear: (): Promise<void> => SecureStore.deleteItemAsync(KEY),
-};
+function buildApiBaseUrl(baseUrl: string, path: string): string {
+  const base = baseUrl.trim().replace(/\/+$/, '');
+  const apiPath = path.trim();
+  if (!apiPath || apiPath === '/') return `${base}/`;
+  return `${base}/${apiPath.replace(/^\/+/, '').replace(/\/+$/, '')}/`;
+}
 ```
-
-> Always use `expo-secure-store` for session tokens. It stores them in Keychain (iOS) and Keystore-backed storage (Android). Never store tokens in `AsyncStorage`.
 
 ---
 
-## Auth event bus — `src/api/authEvents.ts`
+## API Client
 
-React Navigation does not have `window.location`. Use an event emitter so the HTTP client can trigger navigation from outside the component tree.
+The client has one public function:
 
 ```typescript
-import { EventEmitter } from 'events';
-export const authEvents = new EventEmitter();
+apiRequest<T>(schema: string, data?: unknown, opts?: { method?: 'GET' | 'POST'; query?: object }): Promise<T>
 ```
 
----
+Default to `POST /` or `POST /api/` with `{ schema, data }`. Some projects also expose `GET /?schema=...`; support it only as a convenience, not as the primary integration contract.
 
-## API Client — `src/api/client.ts`
+Build schema query strings programmatically and omit empty values:
 
 ```typescript
-import axios, { AxiosError, AxiosResponse } from 'axios';
-import { tokenStorage } from './tokenStorage';
-import { authEvents } from './authEvents';
+function buildSchemaWithQuery(schema: string, query?: object): string {
+  if (!query) return schema;
+  const parts: string[] = [];
 
-const BASE_URL = 'https://totaljsbackend.com';
+  for (const [key, raw] of Object.entries(query)) {
+    if (raw == null || raw === '') continue;
+    const values = Array.isArray(raw) ? raw : [raw];
+    for (const value of values) {
+      if (value == null || value === '') continue;
+      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+    }
+  }
 
-export const apiClient = axios.create({
-  baseURL: BASE_URL,
-  headers: { 'Content-Type': 'application/json' },
-});
+  return parts.length ? `${schema}?${parts.join('&')}` : schema;
+}
+```
 
-// Inject token before every request (async — SecureStore is async)
-apiClient.interceptors.request.use(async (config: any) => {
-  const token = await tokenStorage.get();
-  if (token && config.headers) config.headers['x-token'] = token;
+Attach auth headers from fast in-memory store first, then `SecureStore` as fallback:
+
+```typescript
+apiClient.interceptors.request.use(async (config) => {
+  const storeToken = useAppStore.getState().token;
+  const secureToken = storeToken ? null : await SecureStore.getItemAsync(TOKEN_KEY);
+  const token = storeToken ?? secureToken;
+  const schema = extractSchemaFromRequest(config);
+
+  if (token && !isAnonymousApiSchema(schema)) {
+    config.headers.token = token;
+    config.headers['x-token'] = token;
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+
   return config;
 });
+```
 
-// Handle 401 globally
-apiClient.interceptors.response.use(
-  (res: AxiosResponse) => res,
-  async (err: AxiosError) => {
-    if (err.response?.status === 401) {
-      await tokenStorage.clear();
-      authEvents.emit('unauthorized'); // navigation layer listens to this
-    }
-    return Promise.reject(err);
-  }
-);
+`x-token` is the portable Total.js baseline. Sending `token` and `Authorization: Bearer` as compatibility headers is useful when a project has multiple middlewares or file services.
 
-export async function apiRequest(schema: string, data?: unknown): Promise<any> {
-  const payload: Record<string, unknown> = { schema };
-  if (data !== undefined) payload.data = data;
-  const response = await apiClient.post('/api/', payload);
-  return response.data;
+On `401`, clear the token only for protected schemas. Public schemas such as login, registration, discovery lists, and OTP should not be treated as session expiry.
+
+---
+
+## Anonymous Schema Allowlist
+
+Total.js route definitions show the available API schemas, but do not treat the `+` or `-` prefix in the route string as a portable auth contract:
+
+```javascript
+ROUTE('API / +account_login --> Customers/Login/exec');
+ROUTE('+API / -account_logout --> Customers/logout');
+ROUTE('+API / +account_cart_add/{id} --> Customers/Cart/add');
+```
+
+Confirm public/protected behavior from backend middleware and real responses, then mirror the public schemas in the mobile client:
+
+```typescript
+const ANONYMOUS_API_SCHEMAS = new Set([
+  'account_create',
+  'account_create_mobile',
+  'account_login',
+  'account_login_mobile',
+  'account_login_google',
+  'account_login_facebook',
+  'account_login_github',
+  'account_google',
+  'account_facebook',
+  'account_oauth',
+  'account_oauth_mobile',
+  'account_password',
+  'account_reset',
+  'account_password_reset',
+  'account_verify',
+  'products_smart_list',
+  'categories',
+  'countries_list',
+  'cities_list',
+  'quarters_list',
+  'zones_list',
+  'businesses_listing',
+  'businesses_read',
+  'businesses_products',
+  'service_catalog',
+  'business_availability',
+  'explorer_nearby',
+  'explorer_bounds',
+  'explorer_map',
+  'mobile_home',
+  'announcements',
+  'announcements_read',
+  'otp_sms',
+  'otp_sms_verify',
+  'otp_sms_verify_mobile',
+  'otp_email',
+  'otp_email_verify',
+]);
+```
+
+Compare only the base schema before `/` or `?`:
+
+```typescript
+function getBaseSchema(schema: string): string {
+  return schema.split('?')[0].split('/')[0];
 }
 ```
 
+This prevents stale tokens from being attached to login/register/public discovery calls and prevents public `401` responses from logging users out.
+
 ---
 
-## Error handler — `src/utils/errorHandler.ts`
+## Response Normalization
+
+Total.js responses may be plain payloads, `{ success, value, error }` envelopes, or one-item array envelopes. Normalize in the API client so screens never parse transport shapes.
+
+Rules:
+
+- If the response is `[ { success/value/error/token } ]`, collapse it to the first item.
+- If `success === false` or `error` is present, throw a normalized API error.
+- If root `token` exists and `value` is an object, merge the token into the returned object.
+- If `value` exists, return `value`.
+- If `success === true` with no `value`, return `undefined`.
+- For list endpoints, accept both arrays and `{ items: [] }`.
 
 ```typescript
-export function extractErrorMessage(error: unknown): string {
-  if (Array.isArray(error)) {
-    const first = (error as any[])[0];
-    return first?.error || first?.value || 'An error occurred';
-  }
-  const data = (error as any)?.response?.data;
-  if (data) {
-    if (Array.isArray(data)) return data[0]?.error || 'An error occurred';
-    if (data.error) return data.error;
-  }
-  if ((error as any)?.message) return (error as any).message;
-  if (typeof error === 'string') return error;
-  return 'An unexpected error occurred';
+export function extractItems<T>(payload: unknown): T[] {
+  if (Array.isArray(payload)) return payload as T[];
+  if (payload && typeof payload === 'object' && Array.isArray((payload as any).items))
+    return (payload as any).items as T[];
+  return [];
 }
 ```
 
+Keep one error normalizer for HTTP errors, Total.js array errors, envelope errors, and plain strings. Map network and timeout errors to localized strings before they reach the UI.
+
 ---
 
-## Auth service — `src/services/authService.ts`
+## Auth And Session Hydration
 
-```typescript
-import { apiRequest } from '../api/client';
-import { tokenStorage } from '../api/tokenStorage';
+Store the session token in `expo-secure-store`. Zustand/MMKV can persist non-secret app state such as user snapshot, mode, active business, language, cart count, and notification count, but the token should be restored from SecureStore into memory during bootstrap.
 
-export const authService = {
-  login: async (email: string, password: string) => {
-    const raw = await apiRequest('account_login', { email, password });
-    const item = Array.isArray(raw) ? raw[0] : raw;
-    if (!item.success) throw new Error(item.error || 'Login failed');
-    const token = item.token ?? item.value;
-    if (token) await tokenStorage.set(token);
-    return item;
-  },
+Startup flow:
 
-  register: async (name: string, email: string, password: string) => {
-    const res = await apiRequest('account_create', { name, email, password });
-    if (res?.success && res?.value) await tokenStorage.set(res.value);
-    return res;
-  },
-
-  getProfile: () => apiRequest('account'),
-
-  logout: async () => {
-    await apiRequest('account_logout').catch(() => {});
-    await tokenStorage.clear();
-  },
-
-  changePassword: (current: string, next: string) =>
-    apiRequest('account_password', { current_password: current, new_password: next }),
-
-  requestPasswordReset: (email: string) => apiRequest('account_reset', { email }),
-  verifyAccount: (token: string) => apiRequest('account_verify', { token }),
-
-  // Mobile OAuth — direct ID token exchange
-  loginWithGoogle: async (idToken: string) => {
-    const res = await apiRequest('account_login_google', { token: idToken });
-    const token = res?.value?.token ?? res?.token;
-    if (token) await tokenStorage.set(token);
-    return res;
-  },
-
-  loginWithGithub: async (accessToken: string) => {
-    const res = await apiRequest('account_login_github', { token: accessToken });
-    const token = res?.value?.token ?? res?.token;
-    if (token) await tokenStorage.set(token);
-    return res;
-  },
-
-  generate2FA: () => apiRequest('account_2fa_generate'),
-  enable2FA: (token: string) => apiRequest('account_2fa_enable', { token }),
-  disable2FA: () => apiRequest('account_2fa_disable'),
-  verify2FA: (token: string) => apiRequest('account_2fa_verify', { token }),
-};
+```text
+App starts
+  -> wait for Zustand persisted state hydration
+  -> restore preferred language
+  -> load token from SecureStore
+  -> if no token: clear auth state and show buyer/public shell
+  -> if token: set token in store and call account
+  -> hydrate user, cart count, notification count
+  -> load account_businesses
+  -> if seller mode has no business membership, switch to buyer mode
+  -> choose BuyerShell or SellerShell
 ```
 
----
+Login/register flow:
 
-## Auth store — `src/store/authStore.ts`
-
-```typescript
-import { create } from 'zustand';
-import { authService } from '../services/authService';
-import { tokenStorage } from '../api/tokenStorage';
-
-type User = { id: string; name: string; email: string; role?: string; sa?: boolean };
-
-type AuthState = {
-  user: User | null;
-  isAuthenticated: boolean;
-  isLoading: boolean;
-  initialize: () => Promise<void>;
-  login: (email: string, password: string) => Promise<void>;
-  register: (name: string, email: string, password: string) => Promise<void>;
-  logout: () => Promise<void>;
-  setUser: (user: User) => void;
-};
-
-export const useAuthStore = create<AuthState>((set) => ({
-  user: null,
-  isAuthenticated: false,
-  isLoading: true,
-
-  initialize: async () => {
-    const token = await tokenStorage.get();
-    if (!token) { set({ isLoading: false }); return; }
-    try {
-      const res = await authService.getProfile();
-      if (res.success) set({ user: res.value, isAuthenticated: true });
-    } catch {
-      // 401 already handled by interceptor (token cleared)
-    } finally {
-      set({ isLoading: false });
-    }
-  },
-
-  login: async (email, password) => {
-    const item = await authService.login(email, password);
-    set({ user: item.value ?? { email } as User, isAuthenticated: true });
-  },
-
-  register: async (name, email, password) => {
-    await authService.register(name, email, password);
-    const res = await authService.getProfile();
-    if (res.success) set({ user: res.value, isAuthenticated: true });
-  },
-
-  logout: async () => {
-    await authService.logout();
-    set({ user: null, isAuthenticated: false });
-  },
-
-  setUser: (user) => set({ user }),
-}));
+```text
+account_login_mobile or account_login
+  -> normalize { token, user? } or plain token string
+  -> save token to SecureStore
+  -> set token/user in store
+  -> call account and account_businesses in background
 ```
 
----
+Logout flow:
 
-## Root navigator — `src/navigation/AppNavigator.tsx`
-
-```typescript
-import { useEffect } from 'react';
-import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
-import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { useAuthStore } from '../store/authStore';
-import { authEvents } from '../api/authEvents';
-import { LoginScreen } from '../screens/LoginScreen';
-import { RegisterScreen } from '../screens/RegisterScreen';
-import { DashboardScreen } from '../screens/DashboardScreen';
-
-export const navigationRef = createNavigationContainerRef();
-const Stack = createNativeStackNavigator();
-
-export function AppNavigator() {
-  const { isAuthenticated, isLoading, initialize } = useAuthStore();
-
-  useEffect(() => { initialize(); }, []);
-
-  // Listen for global 401 events
-  useEffect(() => {
-    const handler = () =>
-      navigationRef.current?.reset({ index: 0, routes: [{ name: 'Login' }] });
-    authEvents.on('unauthorized', handler);
-    return () => { authEvents.off('unauthorized', handler); };
-  }, []);
-
-  if (isLoading) return null; // or <SplashScreen />
-
-  return (
-    <NavigationContainer ref={navigationRef}>
-      <Stack.Navigator screenOptions={{ headerShown: false }}>
-        {isAuthenticated ? (
-          <Stack.Screen name="Dashboard" component={DashboardScreen} />
-        ) : (
-          <>
-            <Stack.Screen name="Login" component={LoginScreen} />
-            <Stack.Screen name="Register" component={RegisterScreen} />
-          </>
-        )}
-      </Stack.Navigator>
-    </NavigationContainer>
-  );
-}
+```text
+account_logout best-effort
+  -> delete SecureStore token
+  -> clear auth state
+  -> preserve non-sensitive preferences such as language/country/city
 ```
 
----
-
-## Example service — `src/services/postsService.ts`
-
-```typescript
-import { apiRequest } from '../api/client';
-
-function buildSchema(base: string, params?: Record<string, any>): string {
-  if (!params) return base;
-  const qs = new URLSearchParams(
-    Object.entries(params)
-      .filter(([, v]) => v !== undefined)
-      .map(([k, v]) => [k, String(v)])
-  ).toString();
-  return qs ? `${base}?${qs}` : base;
-}
-
-export const postsService = {
-  list: (params?: { page?: number; limit?: number; status?: string }) =>
-    apiRequest(buildSchema('posts_list', params)),
-
-  read: (id: string) => apiRequest(`posts_read/${id}`),
-  create: (data: { title: string; body: string; status: string }) => apiRequest('posts_create', data),
-  update: (id: string, data: object) => apiRequest(`posts_update/${id}`, data),
-  remove: (id: string) => apiRequest(`posts_remove/${id}`),
-};
-```
+The mobile app can be guest-first: public marketplace screens load without auth, auth opens as a modal, and seller-only navigation mounts only when authenticated.
 
 ---
 
-## Login screen — `src/screens/LoginScreen.tsx`
+## Auth Gate
+
+Use an auth gate for actions that are available from public screens but require login to complete, such as checkout, wishlist, follow, seller dashboard, or booking.
 
 ```typescript
-import { useState } from 'react';
-import {
-  View, Text, TextInput, TouchableOpacity,
-  ActivityIndicator, StyleSheet, KeyboardAvoidingView, Platform,
-} from 'react-native';
-import { useAuthStore } from '../store/authStore';
+let pendingAction: (() => void) | null = null;
 
-export function LoginScreen() {
-  const { login } = useAuthStore();
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
+export function useAuthGate() {
+  const isAuthenticated = useIsAuthenticated();
+  const navigation = useNavigation();
 
-  const handleLogin = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      await login(email.trim(), password);
-      // AuthStore.isAuthenticated changes → AppNavigator re-renders to Dashboard
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-    >
-      <Text style={styles.title}>Sign in</Text>
-      <TextInput
-        style={styles.input}
-        placeholder="Email"
-        value={email}
-        onChangeText={setEmail}
-        keyboardType="email-address"
-        autoCapitalize="none"
-        autoCorrect={false}
-      />
-      <TextInput
-        style={styles.input}
-        placeholder="Password"
-        value={password}
-        onChangeText={setPassword}
-        secureTextEntry
-      />
-      {error ? <Text style={styles.error}>{error}</Text> : null}
-      <TouchableOpacity style={styles.button} onPress={handleLogin} disabled={loading}>
-        {loading
-          ? <ActivityIndicator color="#fff" />
-          : <Text style={styles.buttonText}>Sign in</Text>
-        }
-      </TouchableOpacity>
-    </KeyboardAvoidingView>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: 'center', padding: 24 },
-  title: { fontSize: 24, fontWeight: '700', marginBottom: 24 },
-  input: {
-    borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8,
-    padding: 12, marginBottom: 12, fontSize: 16,
-  },
-  button: {
-    backgroundColor: '#2563eb', borderRadius: 8,
-    padding: 14, alignItems: 'center', marginTop: 8,
-  },
-  buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
-  error: { color: '#dc2626', marginBottom: 8 },
-});
-```
-
----
-
-## File upload
-
-```typescript
-import * as DocumentPicker from 'expo-document-picker';
-import { apiRequest } from '../api/client';
-
-async function uploadAndRegisterDocument() {
-  const result = await DocumentPicker.getDocumentAsync({ type: '*/*' });
-  if (result.canceled) return;
-
-  const file = result.assets[0];
-  const uploadToken = process.env.EXPO_PUBLIC_UPLOAD_TOKEN ?? '';
-  const bucket = process.env.EXPO_PUBLIC_UPLOAD_BUCKET ?? 'documents';
-
-  // Step 1: Upload to file service
-  const form = new FormData();
-  form.append('file', {
-    uri: file.uri,
-    name: file.name,
-    type: file.mimeType ?? 'application/octet-stream',
-  } as any);
-
-  const uploadRes = await fetch(
-    `https://fs.totaljsbackend.com/upload/${bucket}/?token=${uploadToken}&hostname=1`,
-    { method: 'POST', body: form }
-  );
-  const uploadData = await uploadRes.json();
-
-  // Step 2: Register in the app
-  const res = await apiRequest('documents_create', {
-    id:   uploadData.id,
-    url:  uploadData.url,
-    name: uploadData.name ?? file.name,
-    size: uploadData.size ?? file.size,
-    type: uploadData.type ?? file.mimeType,
-  });
-
-  return res.value;
-}
-```
-
----
-
-## WebSocket hook — `src/hooks/useBackendSocket.ts`
-
-```typescript
-import { useEffect, useRef } from 'react';
-import { AppState, AppStateStatus } from 'react-native';
-import { tokenStorage } from '../api/tokenStorage';
-
-export function useBackendSocket(
-  path: string,
-  params: Record<string, string>,
-  onMessage: (msg: any) => void,
-  enabled = true
-) {
-  const wsRef = useRef<WebSocket | null>(null);
-  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const retriesRef = useRef(0);
-  const mountedRef = useRef(true);
-
-  useEffect(() => {
-    if (!enabled) return;
-    mountedRef.current = true;
-
-    async function connect() {
-      if (!mountedRef.current) return;
-      const token = await tokenStorage.get() ?? '';
-      const qs = new URLSearchParams({ ...params, token }).toString();
-      const url = `wss://totaljsbackend.com${path}?${qs}`;
-
-      const ws = new WebSocket(url);
-      wsRef.current = ws;
-
-      ws.onmessage = (e) => {
-        if (!mountedRef.current) return;
-        try { onMessage(JSON.parse(e.data)); } catch {}
-      };
-
-      ws.onclose = (e) => {
-        if (!mountedRef.current || e.code === 1000) return;
-        const delay = Math.min(1000 * 2 ** retriesRef.current, 30000);
-        retriesRef.current++;
-        retryRef.current = setTimeout(connect, delay);
-      };
-
-      ws.onerror = () => ws.close();
-    }
-
-    connect();
-
-    // Pause socket when app goes to background to save battery
-    const handleAppState = (state: AppStateStatus) => {
-      if (state === 'background' || state === 'inactive') {
-        if (retryRef.current) clearTimeout(retryRef.current);
-        wsRef.current?.close(1000);
-      } else if (state === 'active') {
-        retriesRef.current = 0;
-        connect();
+  return {
+    requireAuth(action: () => void) {
+      if (isAuthenticated) action();
+      else {
+        pendingAction = action;
+        navigation.navigate('Auth', { screen: 'Welcome' });
       }
-    };
+    },
+  };
+}
 
-    const sub = AppState.addEventListener('change', handleAppState);
-
-    return () => {
-      mountedRef.current = false;
-      sub.remove();
-      if (retryRef.current) clearTimeout(retryRef.current);
-      wsRef.current?.close(1000);
-    };
-  }, [path, enabled]);
+export function consumePendingAuthAction() {
+  const action = pendingAction;
+  pendingAction = null;
+  action?.();
 }
 ```
 
-Usage:
-
-```typescript
-function NotificationsScreen() {
-  const [events, setEvents] = useState<any[]>([]);
-
-  useBackendSocket('/ws/', {}, (msg) => {
-    if (msg.type === 'notification') {
-      setEvents(prev => [msg.data, ...prev]);
-    }
-  });
-
-  return (
-    <FlatList
-      data={events}
-      keyExtractor={(_, i) => String(i)}
-      renderItem={({ item }) => <Text>{item.title}</Text>}
-    />
-  );
-}
-```
+Call `consumePendingAuthAction()` after successful login/register.
 
 ---
 
-## Key differences from React web
+## Domain API Layer
 
-| Concern | React (web) | React Native |
-|---------|-------------|--------------|
-| Token storage | `localStorage` | `expo-secure-store` |
-| 401 redirect | `window.location.href` | `authEvents` + `navigationRef.reset()` |
-| Navigation | React Router `<Navigate>` | `AppNavigator` re-renders on auth state change |
-| File upload body | `FormData` with `File` | `FormData` with `{ uri, name, type }` object |
-| WebSocket lifecycle | Component unmount | Component unmount + `AppState` background handling |
-| Environment vars | `import.meta.env.VITE_*` | `process.env.EXPO_PUBLIC_*` |
+Do not call schema strings from screens. Keep typed domain APIs thin:
+
+```typescript
+export const productsApi = {
+  smartList: (params?: ProductsListParams) =>
+    apiRequest<unknown>('products_smart_list', undefined, { query: params }).then(extractItems<Product>),
+  read: (id: string) =>
+    apiRequest<Product>(`products_read/${encodeURIComponent(id.trim())}`),
+  insertMobile: (data: Partial<Product>) =>
+    apiRequest<Product>('products_insert_mobile', data),
+};
+```
+
+Useful mobile domains:
+
+- `authApi`: login, mobile login, register, profile, password reset, OAuth.
+- `mobileHomeApi`: cached aggregate home data with fallback to parallel domain calls.
+- `productsApi`: marketplace and seller product actions.
+- `businessesApi`: public discovery and seller business management.
+- `serviceBusinessApi`: public catalog/availability and owner service catalog.
+- `cartApi`, `ordersApi`, `walletApi`, `sellerWalletApi`: authenticated commerce flows.
+
+---
+
+## Uploads
+
+File uploads do not use the Total.js API envelope. Upload multipart form data to the file service, then store the returned URL/metadata through a normal schema if the domain requires it.
+
+Build the bucket from active business id, user id, or `anonymous`:
+
+```typescript
+function buildUploadUrl(userId: string): string {
+  const id = encodeURIComponent(userId || 'anonymous');
+  const hasPlaceholder = UPLOAD_URL.includes('{id}') || UPLOAD_URL.includes('{0}');
+  const raw = UPLOAD_URL.replace('{id}', id).replace('{0}', id);
+  const url = new URL(raw);
+
+  if (!hasPlaceholder)
+    url.pathname = `${url.pathname.replace(/\/+$/, '')}/${id}`;
+
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/`;
+
+  if (UPLOAD_TOKEN && !UPLOAD_AUTH_HEADER && !url.searchParams.has('token'))
+    url.searchParams.set('token', UPLOAD_TOKEN);
+
+  return url.toString();
+}
+```
+
+Auth priority:
+
+1. If `UPLOAD_TOKEN` and `UPLOAD_AUTH_HEADER` are configured, send the upload token in that header.
+2. If `UPLOAD_TOKEN` is configured without a header, add it as `?token=...`.
+3. Otherwise send the user session token as `token`, `x-token`, and `Authorization`.
+
+Normalize relative upload responses into absolute URLs using the upload service origin.
+
+---
+
+## Production Checklist
+
+- `apiRequest()` is the only low-level API entrypoint.
+- API base URL and upload URL are environment-driven.
+- Native localhost is blocked or replaced unless explicitly allowed.
+- Session token lives in SecureStore, not AsyncStorage.
+- Anonymous schemas are explicitly allowlisted and do not receive stale tokens.
+- `401` clears auth only for protected schemas.
+- Response normalization handles envelopes, arrays, root tokens, and raw lists.
+- Domain APIs own schema strings; screens call typed functions/hooks.
+- Auth bootstrap waits for persisted store hydration before navigation decisions.
+- Uploads use the file service and normalize returned URLs.
+- Dev network logs mask token/password/secret fields.

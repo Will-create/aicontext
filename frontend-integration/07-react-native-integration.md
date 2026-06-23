@@ -6,6 +6,8 @@ Reference stack: **Expo + TypeScript + axios + expo-secure-store + Zustand persi
 
 This guide captures the patterns used by the SahelBusiness mobile app. Replace the schema names and hostnames with the ones from your project, but keep the same client architecture.
 
+Backend companion: [Total.js Mobile App Backend Guide](../totaljs/mobile-backend.md).
+
 ---
 
 ## Setup
